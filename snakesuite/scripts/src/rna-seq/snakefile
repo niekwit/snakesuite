@@ -1,0 +1,202 @@
+import glob
+import os
+import pandas as pd
+import click
+
+
+####PREPARE VARIABLES FOR SNAKEMAKE RULES####
+
+#get script directory (git repository)
+script_dir = os.path.dirname(__file__)
+work_dir = os.getcwd()
+
+#load config file
+configfile: "experiment.yaml"
+
+#load variables
+genome = config["general"]["genome"]
+map_with = config["rna-seq"]["map_with"].lower()
+gtf = config["rna-seq"]["gtf"]["salmon"][genome]
+
+#get sample names
+try:
+    csv = pd.read_csv("samples.csv")
+    SAMPLES = csv["sample"]
+except FileNotFoundError:
+    click.echo("ERROR: samples.csv not found!")
+    
+
+
+####SNAKEMAKE RULES####
+
+rule all:
+    input: 
+        expand("qc/fastqc/{sample}{end}.html", sample=SAMPLES, end=["_R1","_R2"]),
+        expand("qc/fastqc/{sample}{end}_fastqc.zip", sample=SAMPLES, end=["_R1","_R2"]),
+        expand("trimmed/{sample}_val_1.fq.gz", sample=SAMPLES),
+        expand("trimmed/{sample}_val_2.fq.gz", sample=SAMPLES),
+        expand("salmon/{sample}/quant.sf", sample=SAMPLES),
+        expand("salmon/{sample}/lib_format_counts.json", sample=SAMPLES),
+        "qc/multiqc.html",
+        "deseq2/deseq2_diff_trx.csv",
+        "deseq2/dds.Rdata",
+        #"plots/pca.pdf",
+        #directory("plots/volcano_plots")
+
+
+
+rule fastqc:
+    input:
+        "reads/{sample}{end}.fastq.gz"
+    output:
+        html="qc/fastqc/{sample}{end}.html",
+        zip="qc/fastqc/{sample}{end}_fastqc.zip" # the suffix _fastqc.zip is necessary for multiqc to find the file. If not using multiqc, you are free to choose an arbitrary filename
+    params:
+        extra = "--quiet"
+    log:
+        "logs/fastqc/{sample}{end}.log"
+    threads: config["resources"]["fastqc"]["cpu"]
+    wrapper:
+        "v2.0.0/bio/fastqc"
+
+
+rule multiqc:
+    input:
+        expand("qc/fastqc/{sample}{end}_fastqc.zip", sample=SAMPLES, end=["_R1","_R2"])
+    output:
+        "qc/multiqc.html"
+    params:
+        extra="",  # Optional: extra parameters for multiqc.
+        use_input_files_only=True, # Optional, use only a.txt and don't search folder samtools_stats for files
+    log:
+        "logs/multiqc/multiqc.log"
+    wrapper:
+        "v1.31.1/bio/multiqc"
+
+
+
+rule trim_galore:
+    input:
+        r1="reads/{sample}_R1.fastq.gz",
+        r2="reads/{sample}_R2.fastq.gz",
+    output:
+        #temp("trimmed/{sample}_val_1.fq.gz"),
+        #temp("trimmed/{sample}_R1.fastq.gz_trimming_report.txt"),
+        #temp("trimmed/{sample}_val_2.fq.gz"),
+        #temp("trimmed/{sample}_R2.fastq.gz_trimming_report.txt"),
+        "trimmed/{sample}_val_1.fq.gz",
+        "trimmed/{sample}_R1.fastq.gz_trimming_report.txt",
+        "trimmed/{sample}_val_2.fq.gz",
+        "trimmed/{sample}_R2.fastq.gz_trimming_report.txt",
+    threads: config["resources"]["trim"]["cpu"]
+    conda:
+        "envs/trim_galore.yml"
+    log:
+        "logs/trim_galore/{sample}.log",
+    shell:
+        "trim_galore -j {threads} -q 20 --basename {wildcards.sample} "
+        "-o trimmed --paired {input.r1} {input.r2} 2> {log}"
+
+
+if map_with == "salmon":
+    rule salmon_quant_reads:
+        input:
+            r1="trimmed/{sample}_val_1.fq.gz",
+            r2="trimmed/{sample}_val_2.fq.gz",
+            index=config["rna-seq"]["index"][map_with][genome],
+            gtf=config["rna-seq"]["gtf"]["salmon"][genome]
+        output:
+            quant="salmon/{sample}/quant.sf",
+            lib="salmon/{sample}/lib_format_counts.json",
+        log:
+            "logs/salmon/{sample}.log",
+        params:
+            # optional parameters
+            libtype=config["rna-seq"]["strandedness"], 
+            extra="--gcBias",
+        threads: config["resources"]["mapping"]["cpu"]
+        resources: 
+                runtime=config["resources"]["mapping"]["time"]
+        wrapper:
+            "v2.0.0/bio/salmon/quant"
+
+
+elif map_with == "star":
+    pass ###to do
+
+
+rule deseq2:
+    input:
+        salmon=expand("salmon/{sample}/quant.sf", sample=SAMPLES)
+    output:
+        csv="deseq2/deseq2_diff_trx.csv",
+        rdata="deseq2/dds.Rdata",
+    params:
+        map_with,
+        genome,
+        gtf,
+    log:
+        "logs/deseq2/deseq2.log"
+    conda:
+        "envs/deseq2.yml"
+    threads: config["resources"]["deseq2"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deseq2"]["time"]
+    script:
+        "scripts/deseq2.R"
+
+'''
+if map_with == "salmon":
+    rule mapping_rates_plot:
+        input:
+            expand("logs/salmon/{sample}.log", sample=SAMPLES)
+        output:
+            "plots/mapping_rates.pdf"
+        script:
+            "scripts/mapping_rates.R"
+
+rule pca_plot:
+    input:
+		"deseq2/dds.Rdata"
+	output:
+		"plots/pca.pdf",
+	conda:
+		"envs/deseq2.yaml"
+	script:
+		"scripts/pca.R"
+
+
+rule heatmap_sample_distance:
+    input:
+		"deseq2/dds.Rdata"
+	output:
+		"plots/heatmap_sample_distance.pdf",
+	conda:
+		"envs/deseq2.yaml"
+	script:
+		"scripts/pca.R"
+
+
+rule volcano_plots:
+	input:
+		"deseq2/deseq2_diff_trx.xlsx"
+	output:
+		directory("plots/volcano_plots")
+	conda:
+		"envs/deseq2.yaml"
+	script:
+		"scripts/volcano.R"
+'''
+
+
+
+
+
+
+
+
+
+
+
+
+
