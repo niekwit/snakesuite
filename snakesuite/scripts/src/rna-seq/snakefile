@@ -17,6 +17,7 @@ configfile: "experiment.yaml"
 genome = config["general"]["genome"]
 map_with = config["rna-seq"]["map_with"].lower()
 gtf = config["rna-seq"]["gtf"]["salmon"][genome]
+read_length = config["general"]["readlength"]
 
 #get sample names
 try:
@@ -38,10 +39,12 @@ rule all:
         expand("salmon/{sample}/quant.sf", sample=SAMPLES),
         expand("salmon/{sample}/lib_format_counts.json", sample=SAMPLES),
         "qc/multiqc.html",
-        "deseq2/deseq2_diff_trx.csv",
+        "deseq2/deseq2_diff_trx.xlsx",
         "deseq2/dds.Rdata",
-        #"plots/pca.pdf",
-        #directory("plots/volcano_plots")
+        "plots/mapping_rates.pdf",
+        "plots/heatmap_sample_distance.pdf",
+        "plots/pca.pdf",
+        "plots/volcano_plots/",
 
 
 
@@ -50,7 +53,7 @@ rule fastqc:
         "reads/{sample}{end}.fastq.gz"
     output:
         html="qc/fastqc/{sample}{end}.html",
-        zip="qc/fastqc/{sample}{end}_fastqc.zip" # the suffix _fastqc.zip is necessary for multiqc to find the file. If not using multiqc, you are free to choose an arbitrary filename
+        zip="qc/fastqc/{sample}{end}_fastqc.zip"
     params:
         extra = "--quiet"
     log:
@@ -72,7 +75,6 @@ rule multiqc:
         "logs/multiqc/multiqc.log"
     wrapper:
         "v1.31.1/bio/multiqc"
-
 
 
 rule trim_galore:
@@ -99,6 +101,7 @@ rule trim_galore:
 
 
 if map_with == "salmon":
+    
     rule salmon_quant_reads:
         input:
             r1="trimmed/{sample}_val_1.fq.gz",
@@ -111,7 +114,7 @@ if map_with == "salmon":
         log:
             "logs/salmon/{sample}.log",
         params:
-            # optional parameters
+            #optional parameters
             libtype=config["rna-seq"]["strandedness"], 
             extra="--gcBias",
         threads: config["resources"]["mapping"]["cpu"]
@@ -121,80 +124,144 @@ if map_with == "salmon":
             "v2.0.0/bio/salmon/quant"
 
 
-elif map_with == "star":
-    pass ###to do
-
-
-rule deseq2:
-    input:
-        salmon=expand("salmon/{sample}/quant.sf", sample=SAMPLES)
-    output:
-        csv="deseq2/deseq2_diff_trx.csv",
-        rdata="deseq2/dds.Rdata",
-    params:
-        map_with,
-        genome,
-        gtf,
-    log:
-        "logs/deseq2/deseq2.log"
-    conda:
-        "envs/deseq2.yml"
-    threads: config["resources"]["deseq2"]["cpu"]
-    resources: 
-        runtime=config["resources"]["deseq2"]["time"]
-    script:
-        "scripts/deseq2.R"
-
-'''
-if map_with == "salmon":
     rule mapping_rates_plot:
         input:
             expand("logs/salmon/{sample}.log", sample=SAMPLES)
         output:
             "plots/mapping_rates.pdf"
+        conda:
+            "envs/deseq2.yml"
         script:
             "scripts/mapping_rates.R"
 
-rule pca_plot:
-    input:
-		"deseq2/dds.Rdata"
-	output:
-		"plots/pca.pdf",
-	conda:
-		"envs/deseq2.yaml"
-	script:
-		"scripts/pca.R"
+
+    rule deseq2:
+        input:
+            salmon=expand("salmon/{sample}/quant.sf", sample=SAMPLES)
+        output:
+            xlsx="deseq2/deseq2_diff_trx.xlsx",
+            rdata="deseq2/dds.Rdata",
+        params:
+            map_with,
+            genome,
+            gtf,
+        log:
+            "logs/deseq2/deseq2.log"
+        conda:
+            "envs/deseq2.yml"
+        threads: config["resources"]["deseq2"]["cpu"]
+        resources: 
+            runtime=config["resources"]["deseq2"]["time"]
+        script:
+            "scripts/deseq2.R"
 
 
+elif map_with == "star":
+    
+    rule star_align:
+        input:
+            idx=config["rna-seq"]["index"]["star"][genome][read_length]
+            r1="trimmed/{sample}_val_1.fq.gz",
+            r2="trimmed/{sample}_val_2.fq.gz",
+        output:
+            "star/{sample}Log.final.out",
+            "star/{sample}Aligned.sortedByCoord.out.bam",
+            "star/{sample}ReadsPerGene.out.tab"
+        log:
+            "logs/star/{sample}.log"
+        params:
+        threads: config["resources"]["mapping"]["cpu"]
+        resources: 
+            runtime=config["resources"]["mapping"]["time"]
+        conda:
+            "envs/star.yml"
+        shell:
+            "STAR "
+            "--runThreadN "
+            "--runMode alignReads "
+            "--genomeDir {input.idx} "
+            "--readFilesIn {input.r1} {input.r2} "
+            "--readFilesCommand zcat "
+            "--quantMode TranscriptomeSAM GeneCounts "
+            "--twopassMode Basic "
+            "--outSAMunmapped None "
+            "--outSAMtype BAM SortedByCoordinate "
+            "--outBAMsortingThreadN 1 "
+            "-outFileNamePrefix star/{wildcards.sample} "
+            "2> {log}"
+
+
+    rule deseq2:
+        input:
+            star=expand("star/{sample}ReadsPerGene.out.tab", sample=SAMPLES)
+        output:
+            xlsx="deseq2/deseq2_diff_trx.xlsx",
+            rdata="deseq2/dds.Rdata",
+        params:
+            map_with,
+            genome,
+            gtf,
+        log:
+            "logs/deseq2/deseq2.log"
+        conda:
+            "envs/deseq2.yml"
+        threads: config["resources"]["deseq2"]["cpu"]
+        resources: 
+            runtime=config["resources"]["deseq2"]["time"]
+        script:
+            "scripts/deseq2.R"
+
+    
+    rule bigwig:
+        pass
+
+
+
+
+        
+        
 rule heatmap_sample_distance:
     input:
-		"deseq2/dds.Rdata"
-	output:
-		"plots/heatmap_sample_distance.pdf",
-	conda:
-		"envs/deseq2.yaml"
-	script:
-		"scripts/pca.R"
+        "deseq2/dds.Rdata"
+    output:
+        "plots/heatmap_sample_distance.pdf"
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/heatmap_sd.R"
+
+
+rule pca_plot:
+    input:
+        "deseq2/dds.Rdata"
+    output:
+        "plots/pca.pdf"
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/pca.R"
 
 
 rule volcano_plots:
-	input:
-		"deseq2/deseq2_diff_trx.xlsx"
-	output:
-		directory("plots/volcano_plots")
-	conda:
-		"envs/deseq2.yaml"
-	script:
-		"scripts/volcano.R"
-'''
+    input:
+        "deseq2/deseq2_diff_trx.xlsx"
+    output:
+        directory("plots/volcano_plots/")
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/volcano.R"
 
 
-
-
-
-
-
-
+rule heatmap_countmatrix:
+    input:
+        "deseq2/dds.Rdata"
+    output:
+        "plots/heatmap_sample_distance.pdf",
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/heatmap_cm.R"
 
 
 

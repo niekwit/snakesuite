@@ -1,3 +1,5 @@
+options(show.error.locations = TRUE)
+
 ####load snakemake variables####
 map.with <- snakemake@params[[1]]
 genome <- snakemake@params[[2]]
@@ -78,12 +80,7 @@ df.list <- vector(mode="list", length=length(references))
 for (i in 1:length(references)){
   df.list[[i]] <- vector(mode="list", length=(length(unique(samples$comb)) - 1 ))
 }
-#df.list <- vector(mode="list", length=(length(references) * (length(unique(samples$comb)) - 1)))
 
-#create vector to store contrast names
-#names <- vector(mode="character", length=(length(references) * length(unique(samples$comb)) - 1 ))
-
-#counter <- 1
 
 #for each reference sample, perform pairwise comparisons with all the other samples
 for (r in 1:length(references)){
@@ -113,16 +110,8 @@ for (r in 1:length(references)){
     
     res <- results(dds_relevel, name=comparisons[[c]])
     
-    #res <- results(dds_relevel)
-    
     df <- as.data.frame(res) %>%
       mutate(ensembl_gene_id = res@rownames, .before=1) 
-    
-    #create empty data frame to collect all data from all reference levels and contrasts at first one
-    #if (r == 1 & c == 1 ){
-    #  df.all <- as.data.frame(matrix(nrow=0, ncol=ncol(df)))
-    #  names(df.all) <- names(df)
-    #} 
     
     #annotate df
     df$ensembl_gene_id <- gsub("\\.[0-9]*","",df$ensembl_gene_id) #tidy up gene IDs
@@ -149,7 +138,6 @@ for (r in 1:length(references)){
     temp$ensembl_gene_id <- gsub("\\.[0-9]*","",temp$ensembl_gene_id) #tidy up gene IDs
     names(temp)[1:length(dds_relevel@colData@listData$sample)] <- dds_relevel@colData@listData$sample
     
-    
     df <- left_join(df,temp, by="ensembl_gene_id")
     
     #move some columns around
@@ -164,29 +152,17 @@ for (r in 1:length(references)){
     df <- df %>%
       mutate(contrast_name = comparison, .before=1)
     
-    #add data from df to df.all
-    #df.all <- rbind(df.all, df)
-    
-    #counter for index in names
-    counter <- counter + 1
-    
     #sheet title can be max 31 characters
     #add column with contrast name and change it to a number (counter)
     df <- df %>%
       mutate(contrast_name = comparison, .before=1)
     
-   
     #save df to df.list
     df.list[[r]][[c]] <- df
     
   }
   
 }
-
-#write df.all to csv file
-#write.csv(df.all,
-#          file=snakemake@output[["csv"]],
-#          row.names=FALSE)
 
 #function to flatten lists (https://stackoverflow.com/questions/16300344/how-to-flatten-a-list-of-lists/41882883#41882883)
 flattenlist <- function(x){  
@@ -199,7 +175,6 @@ flattenlist <- function(x){
   }
 }
 
-
 #write all data frames in df.list to sheets in Excel file
 library(openxlsx)
 
@@ -209,7 +184,13 @@ df.list <- flattenlist(df.list)
 #name data frames in list
 names(df.list) <- 1: (length(references) * (length(unique(samples$comb)) - 1))
 
+#write to file
+print(paste0("Saving results to ",snakemake@output[[1]]," ..."))
 write.xlsx(df.list, 
-           file = snakemake@output[["xlsx"]],
+           snakemake@output[[1]],
            colNames = TRUE)
+
+
+
+
 

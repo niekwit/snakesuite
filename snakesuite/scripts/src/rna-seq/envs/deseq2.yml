@@ -15,3 +15,8 @@ dependencies:
   - bioconductor-tximport
   - r-ggplot2
   - r-readr
+  - r-readxl
+  - r-openxlsx
+  - r-foreach
+  - r-pheatmap
+  - r-ggrepel
