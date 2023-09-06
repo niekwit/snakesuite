@@ -1,0 +1,671 @@
+import sys
+import os
+import pandas as pd
+import click
+import numpy as np
+
+####CHIP-SEQ PIPELINE####
+
+
+####PREPARE VARIABLES FOR SNAKEMAKE RULES####
+
+#get script directory 
+script_dir = os.path.dirname(__file__)
+
+#load config file
+configfile: "experiment.yaml"
+
+#load variables
+genome = config["general"]["genome"]
+fasta = config["general"]["fasta"][genome]
+gtf = config["general"]["gtf"][genome]
+read_length = config["general"]["readlength"]
+regions = config["chip-seq"]["macs2"]["regions"]
+
+#get experiment and sample information
+try:
+    
+    csv = pd.read_csv("samples.csv")
+    
+    GENOTYPES = list(csv["genotype"])
+    REPLICATES = list(csv["sample"])
+    FACTORS = list(csv["factor"])
+    TREATMENTS = list(csv["treatment"])
+
+    SAMPLE_IP = [f"{a}_{b}_{c}_{d}" for a,b,c,d in zip(GENOTYPES,REPLICATES,FACTORS,TREATMENTS)]
+    SAMPLE_INPUT = [f"{a}_{b}_{c}_{d}" for a,b,c,d in zip(GENOTYPES,REPLICATES,(len(FACTORS)*["input"]),TREATMENTS)]
+
+    SAMPLES = SAMPLE_IP + SAMPLE_INPUT 
+    
+    #check if SAMPLES corresponds to files in reads directory
+    def check(sample,read):
+            
+            if not os.path.isfile(f"reads/{sample}{read}.fastq.gz"):
+                
+                click.secho(f"ERROR: reads/{sample}{read}.fastq.gz not found!", fg="red")
+                
+                sys.exit(1)
+    
+    for sample in SAMPLES:
+        
+        check(sample,"_R1")
+        check(sample,"_R2")
+      
+    #prepares lists for input/names into peak calling for using all replicates in one group
+    #assumes same replicate number for each sample group
+    index = max(REPLICATES)
+    SAMPLE_IP_ALL = [SAMPLE_IP[i:i+index] for i in range(0, len(SAMPLE_IP), index)] #groups samples by replicate
+    SAMPLE_INPUT_ALL = [SAMPLE_INPUT[i:i+index] for i in range(0, len(SAMPLE_INPUT), index)] #groups samples by replicate
+    
+    SAMPLE_IP_NAMES = list(set([f"{x}_{y}_{z}" for x,y,z in zip(GENOTYPES,FACTORS,TREATMENTS)])) 
+    
+except FileNotFoundError:
+    
+    click.secho(f"ERROR: samples.csv not found in {os.getcwd()}!", fg="red")
+    
+    sys.exit(1)
+
+#set regions for macs2
+if config["chip-seq"]["macs2"]["regions"] == "broad":
+    
+    cutoff = config["chip-seq"]["macs2"]["broad_cutoff"]
+    regions = f" --broad --broad-cutoff {cutoff}"
+
+
+
+####SNAKEMAKE RULES####
+
+#define targets
+TARGETS = [
+        "qc/multiqc/multiqc.html",
+        expand("qc/fastqc/{sample}{read}.html", sample=SAMPLES, read=["_R1","_R2"]),
+        expand("qc/fastqc/{sample}{read}_fastqc.zip", sample=SAMPLES, read=["_R1","_R2"]),
+        expand("trimmed/{sample}_val_1.fq.gz", sample=SAMPLES),
+        expand("trimmed/{sample}_val_2.fq.gz", sample=SAMPLES),
+        expand("mapped/{sample}.bam", sample=SAMPLES),
+        expand("mapped/{sample}_dedup.bam", sample=SAMPLES),
+        expand("mapped/{sample}_bl.bam", sample=SAMPLES),
+        expand("mapped/{sample}_bl-sorted.bam", sample=SAMPLES),
+        expand("mapped/{sample}_dedup.bam", sample=SAMPLES,),
+        expand("mapped/{sample}_dedup.bam.bai", sample=SAMPLES),
+        #"qc/readcount_plot.pdf",
+        "qc/mapping_rate_plot.pdf",
+        "qc/fingerprint.pdf",
+        expand("bigwig/single/{sample}.bw", sample=SAMPLES),
+        expand("bigwig/compare/{sample_ip}_vs_{sample_input}.bw", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT),
+        "bigwig/multibigwig_summary.npz",
+        "bigwig/correlation_heatmap.pdf",
+        "bigwig/pca_plot.pdf",
+        "bigwig/pca_data.txt",
+        expand("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.xls", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT),
+        expand("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_summits.bed", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT),
+        expand("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks_annotated.txt", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT),
+        expand("peaks/{name}/{name}_peaks.narrowPeak", name=SAMPLE_IP_NAMES),
+        expand("peaks/{name}/{name}_peaks.xls", name=SAMPLE_IP_NAMES),
+        expand("peaks/{name}/{name}_summits.bed", name=SAMPLE_IP_NAMES),
+        "diffpeaks/diffbind.RData",
+        "diffpeaks/diffbind.xlsx",
+        "diffpeaks/diffbind_samples.csv",
+        f"homer_{genome}_installed",
+        ]
+        
+
+if regions == "narrow":
+    
+    TARGETS + [expand("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.narrowPeak", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT)]
+
+elif regions == "broad":
+
+    TARGETS + [expand("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.broadPeak", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT),
+            expand("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.gappedPeak", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT),]
+
+
+#define local rules (small jobs that can be run on login node)
+localrules: all, mapping_rates_plot, convert_xls2bed, convert_xls2bed_replicates, index_fasta, chrom_sizes
+
+
+#target rule
+rule all:
+    input:
+        TARGETS
+
+
+rule fastqc:
+    input:
+        "reads/{sample}{read}.fastq.gz"
+    output:
+        html="qc/fastqc/{sample}{read}.html",
+        zip="qc/fastqc/{sample}{read}_fastqc.zip",
+    params:
+        extra = "--quiet"
+    log:
+        "logs/fastqc/{sample}{read}.log"
+    threads: config["resources"]["fastqc"]["cpu"]
+    wrapper:
+        "v2.0.0/bio/fastqc"
+
+
+rule multiqc:
+    input:
+        expand("qc/fastqc/{sample}{read}_fastqc.zip", sample=SAMPLES, read=["_R1","_R2"]),
+    output:
+        "qc/multiqc/multiqc.html"
+    params:
+        extra="",  # Optional: extra parameters for multiqc.
+        use_input_files_only=True, # Optional, use only a.txt and don't search folder samtools_stats for files
+    log:
+        "logs/multiqc/multiqc.log"
+    wrapper:
+        "v1.31.1/bio/multiqc"
+
+
+rule trim:
+    input:
+        r1="reads/{sample}_R1.fastq.gz",
+        r2="reads/{sample}_R2.fastq.gz",
+    output:
+        #temp("trimmed/{sample}_val_1.fq.gz"),
+        #temp("trimmed/{sample}_R1.fastq.gz_trimming_report.txt"),
+        #temp("trimmed/{sample}_val_2.fq.gz"),
+        #temp("trimmed/{sample}_R2.fastq.gz_trimming_report.txt"),
+        #temp(multiext("trimmed/{sample}", 
+        #    "_val_1.fq.gz",
+        #    "_R1.fastq.gz_trimming_report.txt",
+        #    "_val_2.fq.gz",
+        #    "_R2.fastq.gz_trimming_report.txt",)),
+        multiext("trimmed/{sample}", 
+            "_val_1.fq.gz",
+            "_R1.fastq.gz_trimming_report.txt",
+            "_val_2.fq.gz",
+            "_R2.fastq.gz_trimming_report.txt",),
+    threads: config["resources"]["trim"]["cpu"]
+    resources:
+        runtime=config["resources"]["trim"]["time"]
+    conda:
+        "envs/read-processing.yaml"
+    log:
+        "logs/trim_galore/{sample}.log",
+    shell:
+        "trim_galore -j {threads} -q 20 --basename {wildcards.sample} "
+        "-o trimmed --paired {input.r1} {input.r2} 2> {log}"
+
+
+rule map2genome:
+    input:
+        r1="trimmed/{sample}_val_1.fq.gz",
+        r2="trimmed/{sample}_val_2.fq.gz",
+    output:
+        temp("mapped/{sample}.bam"),
+    threads: config["resources"]["mapping"]["cpu"]
+    params:
+        idx=config["chip-seq"]["index"][genome]
+    resources: 
+        runtime=config["resources"]["mapping"]["time"]
+    conda:
+        "envs/read-processing.yaml"
+    log:
+        "logs/mapping/{sample}.log"
+    shell:
+        "hisat2 -t -p {threads} -x {params.idx} -1 {input.r1} -2 {input.r2} 2> {log} | "
+        "samtools view -F 260 -bS -@ {threads} > {output}"
+
+
+rule mapping_rates_plot:
+    input:
+        expand("logs/mapping/{sample}.log", sample=SAMPLES),
+    output:
+        "qc/mapping_rate_plot.pdf",
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources:
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    script:
+        "scripts/mapping_rates_plot.py"
+
+
+rule remove_blacklisted_regions:
+    input:
+        "mapped/{sample}.bam"
+    output:
+        temp("mapped/{sample}_bl.bam"),
+    params:
+        bl=config["chip-seq"]["blacklist"][genome],
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/read-processing.yaml"
+    shell:
+        "bedtools intersect -v -a {input} -b {params.bl} -nonamecheck > {output}"
+
+
+rule sort:
+    input:
+        "mapped/{sample}_bl.bam",
+    output:
+        temp("mapped/{sample}_bl-sorted.bam"),
+    threads: config["resources"]["samtools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["samtools"]["time"]
+    conda:
+        "envs/read-processing.yaml"
+    shell:
+        "samtools sort -@ {threads} -o {output} {input}"
+
+
+rule deduplication:
+    input:
+        "mapped/{sample}_bl-sorted.bam"
+    output:
+        "mapped/{sample}_dedup.bam"
+    threads: config["resources"]["samtools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["samtools"]["time"]
+    conda:
+        "envs/read-processing.yaml"
+    log:
+        "logs/deduplication/picard.{sample}.log"
+    shell:
+        "picard MarkDuplicates INPUT={input} OUTPUT={output} REMOVE_DUPLICATES=TRUE "
+        "METRICS_FILE=logs/deduplication/picard.{wildcards.sample}.log"
+
+
+rule index:
+    input:
+        "mapped/{sample}_dedup.bam"
+    output:
+        "mapped/{sample}_dedup.bam.bai",
+    threads: config["resources"]["samtools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["samtools"]["time"]
+    conda:
+        "envs/read-processing.yaml"
+    shell:
+        "samtools index -@ {threads} {input}"
+
+#TO DO: DOES NOT WORK, GIVES CRYPTIC ERROR MESSAGE IN PYTHON SCRIPT
+rule readcount_plot: #plot read counts pre and post deduplication
+    input:
+        pre=expand("mapped/{sample}_bl-sorted.bam", sample=SAMPLES),
+        post=expand("mapped/{sample}_dedup.bam", sample=SAMPLES),
+    output:
+        "qc/readcount_plot.pdf",
+    threads: config["resources"]["samtools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["samtools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    script:
+        "scripts/readcount_plot.py"
+
+
+rule plot_fingerprint:
+    input:
+        bam=expand("mapped/{sample}_dedup.bam", sample=SAMPLES),
+        idx=expand("mapped/{sample}_dedup.bam.bai", sample=SAMPLES),
+    output:
+        "qc/fingerprint.pdf",
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:  
+        "envs/deeptools.yaml"
+    shell:
+        "plotFingerprint -b {input.bam} -o {output} --smartLabels --minMappingQuality 30"
+
+
+rule bigwig:
+    input:
+        bam="mapped/{sample}_dedup.bam",
+        index="mapped/{sample}_dedup.bam.bai",
+    output:
+        "bigwig/single/{sample}.bw",
+    params:
+        bs=config["general"]["bigwig"]["binSize"],
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    shell:
+        "bamCoverage -p {threads} -b {input.bam} -o {output} --extendReads"
+
+
+rule multi_bigwig_summary:
+    input:
+        expand("bigwig/single/{sample}.bw", sample=SAMPLES),
+    output:
+        "bigwig/multibigwig_summary.npz",
+    threads: config["resources"]["deeptools"]["cpu"] * 2
+    params:
+        colours="",
+        markers="",
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    shell:
+        "multiBigwigSummary bins -p {threads} -b {input} -o {output} --labels {SAMPLES}"
+
+#TO DO: fix pca plot markup
+def pca_markup(n):
+    "creates list of colours or markers for pca plot based on number of replicates/genotypes/treatments"
+
+    main_colours = ["black","firebrick","dodgerblue","forestgreen","pink",
+                     "cyan","orchid","purple","navy","slategrey"]
+    
+    main_markers = ["'s'","'o'","'<'","'>'","'v'","'^'","'D'","'p'","'X'","'*'","'+'","'H'"]
+    
+    total_samples = len(SAMPLES)
+    replicates = len(REPLICATES)
+    genotypes = len(set(GENOTYPES))
+    treatments = len(set(TREATMENTS))
+       
+    if n == "markers":        
+        
+        markers = main_markers[:treatments * 2] #* 2 for ip and input
+        markers = list(np.concatenate([([i] * replicates) for i in markers], axis=0))* genotypes
+        
+        return markers
+
+    elif n == "colours":
+        
+        colours = main_colours[:treatments * 2]
+        colours = list(np.concatenate([([i] * replicates) for i in colours], axis=0))* genotypes
+        
+        return colours
+
+
+rule plot_pca:
+    input:
+        "bigwig/multibigwig_summary.npz",
+    output:
+        plot="bigwig/pca_plot.pdf",
+        data="bigwig/pca_data.txt",
+    params:
+        colours=pca_markup("colours"),
+        markers=pca_markup("markers"),
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources:
+        time=config["resources"]["deeptools"]["time"],
+    conda:
+        "envs/deeptools.yaml"
+    shell:
+        "plotPCA -in {input} -o {output.plot} --plotFileFormat pdf --outFileNameData {output.data}"
+        #"plotPCA -in {input} -o {output.plot} --plotFileFormat pdf --colors {params.colours} "
+        #"  --markers {params.markers} --outFileNameData {output.data}"
+
+
+rule spearman_correlation_heatmap:
+    input:
+        "bigwig/multibigwig_summary.npz",
+    output:
+        "bigwig/correlation_heatmap.pdf",
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources:
+        time=config["resources"]["deeptools"]["time"],
+    conda:
+        "envs/deeptools.yaml"
+    shell:
+        "plotCorrelation --corMethod spearman --whatToPlot heatmap -in {input} -o {output} " 
+        "--skipZeros --colorMap viridis"
+
+
+rule bigwig_sample_vs_input:
+    input:
+        ip="mapped/{sample_ip}_dedup.bam",
+        ipx="mapped/{sample_ip}_dedup.bam.bai",
+        inpt="mapped/{sample_input}_dedup.bam",
+        inptx="mapped/{sample_input}_dedup.bam.bai",
+    output:
+        "bigwig/compare/{sample_ip}_vs_{sample_input}.bw",
+    params:
+        bs=config["general"]["bigwig"]["binSize"],
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    shell:
+        "bamCompare -p {threads} -bs {params.bs} -b1 {input.ip} -b2 {input.inpt} -o {output}"
+
+
+rule index_fasta:
+    output:
+        f"{fasta}.fai",
+    threads: config["resources"]["samtools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["samtools"]["time"]
+    conda:
+        "envs/samtools.yaml"
+    shell:
+        "samtools faidx {fasta}"
+
+
+rule chrom_sizes:
+    input:
+        f"{fasta}.fai"
+    output:
+        "chrom_sizes/{genome}.chrom.sizes"
+    threads: config["resources"]["samtools"]["cpu"]
+    resources:
+        runtime=config["resources"]["samtools"]["time"]
+    conda:  
+        "envs/samtools.yaml"
+    shell:
+        "cut -f 1,2 {input} > {output}"
+
+
+rule bigwig_replicates:
+    input:
+        expand("bigwig/single/{sample}.bw", sample=SAMPLES),
+    output:
+        directory("bigwig/replicates"),
+    params:
+        cs="chrom_sizes/{genome}.chrom.sizes",
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    script:
+        "scripts/bigwig_replicates.py"
+
+
+rule compute_matrix:
+    input:
+        expand("bigwig/replicates/{name}.bw", sample=SAMPLE_IP_NAMES),
+    output:
+        "bigwig/replicates/matrix.gz",
+    threads: config["resources"]["deeptools"]["cpu"]
+    params:
+        gtf=config["general"]["gtf"][genome],
+        up=config["chip-seq"]["profile_plot"]["upstream"],
+        down=config["chip-seq"]["profile_plot"]["downstream"],
+        length=config["chip-seq"]["profile_plot"]["rel_body_length"],
+        cr=config["chip-seq"]["profile_plot"]["custom_regions"],
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    shell:
+        "computeMatrix scale-regions -p {threads} --skipZeros -S {input} -R {params.gtf} {params.cr} -a {params.up} -b {params.down} -o {output} "
+
+
+rule profile_plot:
+    input:
+        "bigwig/replicates/matrix.gz",
+    output:
+        "bigwig/replicates/profile_plot.pdf",
+    params:
+        names: config["chip-seq"]["profile_plot"]["custom_regions_names"],
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/deeptools.yaml"
+    shell:
+        "plotProfile -m {input} -o {output} --perGroup --regionsLabel {params.names}"
+
+
+rule profile_plot as heatmap:
+    output:
+        "bigwig/replicates/heatmap.pdf",
+    shell:
+        "plotHeatmap -m {input} -o {output} --colorMap RdBu"
+
+
+if regions == "narrow":
+    
+    rule peak_calling_narrow_single:
+        input:
+            ip="mapped/{sample_ip}_dedup.bam",
+            ipx="mapped/{sample_ip}_dedup.bam.bai",
+            inpt="mapped/{sample_input}_dedup.bam",
+            inptx="mapped/{sample_input}_dedup.bam.bai",
+        output:
+            multiext("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}", 
+            "_peaks.narrowPeak", 
+            "_peaks.xls",
+            "_summits.bed",),
+        params:
+            g=config["chip-seq"]["macs2"]["genome"],
+            q=config["chip-seq"]["macs2"]["qvalue"],
+            extra=config["chip-seq"]["macs2"]["extra_params"],
+        threads: config["resources"]["macs2"]["cpu"]
+        resources: 
+            runtime=config["resources"]["macs2"]["time"]
+        conda:
+            "envs/macs2.yaml"
+        shell:
+            "macs2 callpeak -t {input.ip} -c {input.inpt} -n {wildcards.sample_ip} --outdir peaks/{wildcards.sample_ip}_vs_{wildcards.sample_input} -f BAMPE -g {params.g} -q {params.q} {params.extra}"
+
+   
+    rule peak_calling_narrow_all:
+        input:
+            expand("mapped/{sample}_dedup.bam", sample=SAMPLES),
+            expand("mapped/{sample}_dedup.bam.bai", sample=SAMPLES),
+        output:
+            expand("peaks/{name}/{name}_peaks.narrowPeak", name=SAMPLE_IP_NAMES),
+            expand("peaks/{name}/{name}_peaks.xls", name=SAMPLE_IP_NAMES),
+            expand("peaks/{name}/{name}_summits.bed", name=SAMPLE_IP_NAMES),
+        params:
+            g=config["chip-seq"]["macs2"]["genome"],
+            q=config["chip-seq"]["macs2"]["qvalue"],
+            e=config["chip-seq"]["macs2"]["extra_params"],
+            r=regions,
+        threads: config["resources"]["macs2"]["cpu"]
+        resources: 
+            runtime=config["resources"]["macs2"]["time"]
+        conda:
+            "envs/macs2.yaml"
+        script:
+            "scripts/macs2_replicates.py"
+    
+
+elif regions == "broad":
+
+    regions = "--broad --broadcutoff"
+
+    rule peak_calling_broad_single:
+        input:
+            ip="mapped/{sample_ip}_dedup.bam",
+            inpt="mapped/{sample_input}_dedup.bam",
+        output:
+            multiext("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}", 
+            "_peaks.broadPeak", 
+            "_peaks.xls",
+            "_summits.bed",
+            "_peaks.gappedPeak",),
+        params:
+            g=config["chip-seq"]["macs2"]["genome"],
+            q=config["chip-seq"]["macs2"]["qvalue"],
+            r=regions,
+            rc=config["chip-seq"]["macs2"]["broad_cutoff"],
+            extra=config["chip-seq"]["macs2"]["extra_params"],
+        threads: config["resources"]["macs2"]["cpu"]
+        resources: 
+            runtime=config["resources"]["macs2"]["time"]
+        conda:
+            "envs/macs2.yaml"
+        shell:
+            "macs2 callpeak -t {input.ip} -c {input.inpt} -n {wildcards.sample_ip} --outdir peaks/{wildcards.sample_ip} "
+            "-f BAMPE -g {params.g} -q {params.q} {params.r} {params.rc} {params.extra}"
+
+
+rule convert_xls2bed:
+    input:
+        "peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.xls"
+    output:
+        "peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.bed"
+    shell:
+        r"tail -n +31 {input} | awk -v OFS='\t' '{{print $1,$2,$3,$10}}' > {output}" #raw string escapes \t
+
+
+rule install_homer_genome:
+    output:
+        output=touch("homer_{genome}_installed"),
+    conda:
+        "envs/macs2.yaml"
+    shell:
+        "perl $CONDA_PREFIX/share/homer/configureHomer.pl -install {wildcards.genome}"
+
+
+rule annotate_peaks:
+        input:
+            "peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.bed",
+            f"homer_{genome}_installed",
+        output:
+            "peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks_annotated.txt"
+        params:
+            genome=config["general"]["genome"],
+            regions=config["chip-seq"]["macs2"]["regions"],
+        threads: config["resources"]["macs2"]["cpu"]
+        resources: 
+            runtime=config["resources"]["macs2"]["time"]
+        conda:
+            "envs/macs2.yaml"
+        shell:
+            "annotatePeaks.pl {input} {params.genome} > {output}"
+
+
+rule convert_xls2bed as convert_xls2bed_replicates:
+        input:
+            "peaks/{name}/{name}_peaks.xls",
+        output:
+            "peaks/{name}/{name}_peaks.bed",
+
+
+rule annotate_peaks as annotate_peaks_replicates:
+    input:
+        "peaks/{name}/{name}_peaks.bed",
+        f"homer_{genome}_installed",
+    output:
+        "peaks/{name}/{name}_peaks_annotated.txt"
+
+
+rule diff_peaks:    
+    input:
+        ip_bam=expand("mapped/{sample_ip}_dedup.bam", sample_ip=SAMPLE_IP),
+        inpt_bam=expand("mapped/{sample_input}_dedup.bam", sample_input=SAMPLE_INPUT),
+        peaks=expand("peaks/{sample_ip}_vs_{sample_input}/{sample_ip}_peaks.xls", zip, sample_ip=SAMPLE_IP, sample_input=SAMPLE_INPUT),
+    output:
+        "diffpeaks/diffbind.RData", #DiffBind object
+        "diffpeaks/diffbind.xlsx", #contains a sheet for each reference sample
+        "diffpeaks/diffbind_samples.csv", #DiffBind sample info input file
+    params:
+        genome=genome,
+    threads: config["resources"]["diffbind"]["cpu"]
+    resources:
+        runtime=config["resources"]["diffbind"]["time"]
+    conda:
+        "envs/r.yaml"
+    script:
+        "scripts/diff_peaks.R"
+
+
+
+
+
+

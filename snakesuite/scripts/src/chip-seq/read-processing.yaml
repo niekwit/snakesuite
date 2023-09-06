@@ -1,0 +1,11 @@
+name: read-processing
+channels: 
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - trim-galore=0.6.10
+  - hisat2=2.2.1
+  - samtools=1.17
+  - bedtools=2.31.0
+  - picard=3.0.0

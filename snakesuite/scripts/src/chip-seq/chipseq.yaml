@@ -1,0 +1,23 @@
+name: chipseq
+channels: 
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - trim-galore=0.6.10
+  - hisat2=2.2.1
+  - samtools=1.17
+  - bedtools=2.31.0
+  - picard=3.0.0
+  
+  
+  - deeptools=3.5.2
+  - macs2=2.2.9.1
+  - bioconductor-diffbind=3.10.0
+  - bioconductor-ensdb.hsapiens.v86=2.99.0
+  - bioconductor-ensdb.mmusculus.v79=2.99.0
+  - bioconductor-chipseeker=1.36.0
+  - bioconductor-genomicfeatures=1.52.1
+  - mysql-connector-python=8.0.32
+  - r-rmariadb=1.2.2
+  - r-base >=4.2

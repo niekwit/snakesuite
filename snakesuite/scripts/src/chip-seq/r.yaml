@@ -1,0 +1,13 @@
+name: r
+channels: 
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+- bioconductor-diffbind=3.10.0
+- bioconductor-ensdb.hsapiens.v86=2.99.0
+- bioconductor-ensdb.mmusculus.v79=2.99.0
+- bioconductor-chipseeker=1.36.0
+- bioconductor-chippeakanno=3.34.1
+- bioconductor-genomicfeatures=1.52.1
+- r-base >=4.2
