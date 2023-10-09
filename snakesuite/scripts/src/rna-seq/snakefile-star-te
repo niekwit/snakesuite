@@ -1,0 +1,203 @@
+####TE TRANSCRIPTS ANALYSIS####
+
+import glob
+import os
+import pandas as pd
+import click
+import sys
+
+####PREPARE VARIABLES FOR SNAKEMAKE RULES####
+
+#get script directory (git repository)
+script_dir = os.path.dirname(__file__)
+work_dir = os.getcwd()
+
+#load config file
+configfile: "experiment.yaml"
+
+#load variables
+genome = config["general"]["genome"]
+read_length = config["general"]["readlength"]
+
+#get sample names
+try:
+    csv = pd.read_csv("samples.csv")
+    SAMPLES = csv["sample"]
+except FileNotFoundError:
+    click.echo("ERROR: samples.csv not found!")
+    sys.exit(1)
+
+
+
+#indexing before TE count
+ruleorder: index > TEcount
+
+
+rule all:
+    input: 
+        expand("qc/fastqc/{sample}{end}.html", sample=SAMPLES, end=["_R1","_R2"]),
+        expand("qc/fastqc/{sample}{end}_fastqc.zip", sample=SAMPLES, end=["_R1","_R2"]),
+        expand("trimmed/{sample}_val_1.fq.gz", sample=SAMPLES),
+        expand("trimmed/{sample}_val_2.fq.gz", sample=SAMPLES),
+        expand("mapped/{sample}/{sample}Aligned.sortedByCoord.out.bam.bai", sample=SAMPLES),
+        expand(directory("tecount/{sample}/"), sample=SAMPLES),
+
+
+
+rule fastqc:
+    input:
+        "reads/{sample}{end}.fastq.gz"
+    output:
+        html="qc/fastqc/{sample}{end}.html",
+        zip="qc/fastqc/{sample}{end}_fastqc.zip"
+    params:
+        extra = "--quiet"
+    log:
+        "logs/fastqc/{sample}{end}.log"
+    threads: config["resources"]["fastqc"]["cpu"]
+    wrapper:
+        "v2.0.0/bio/fastqc"
+
+
+rule multiqc:
+    input:
+        expand("qc/fastqc/{sample}{end}_fastqc.zip", sample=SAMPLES, end=["_R1","_R2"])
+    output:
+        "qc/multiqc.html"
+    params:
+        extra="",  # Optional: extra parameters for multiqc.
+        use_input_files_only=True, # Optional, use only a.txt and don't search folder samtools_stats for files
+    log:
+        "logs/multiqc/multiqc.log"
+    wrapper:
+        "v1.31.1/bio/multiqc"
+
+
+rule trim_galore:
+    input:
+        r1="reads/{sample}_R1.fastq.gz",
+        r2="reads/{sample}_R2.fastq.gz",
+    output:
+        temp("trimmed/{sample}_val_1.fq.gz"),
+        temp("trimmed/{sample}_R1.fastq.gz_trimming_report.txt"),
+        temp("trimmed/{sample}_val_2.fq.gz"),
+        temp("trimmed/{sample}_R2.fastq.gz_trimming_report.txt"),
+    threads: config["resources"]["trim"]["cpu"]
+    conda:
+        "envs/te.yaml"
+    log:
+        "logs/trim_galore/{sample}.log",
+    shell:
+        "trim_galore -j {threads} -q 20 --basename {wildcards.sample} "
+        "-o trimmed --paired {input.r1} {input.r2} 2> {log}"
+
+
+rule mapping:
+    input:
+        val1="trimmed/{sample}_val_1.fq.gz"
+        val2="trimmed/{sample}_val_2.fq.gz"
+    output:
+        "mapped/{sample}/{sample}Log.final.out",
+        "mapped/{sample}/{sample}Aligned.sortedByCoord.out.bam",
+        "mapped/{sample}/{sample}ReadsPerGene.out.tab",
+    params:
+        idx=config["rna-seq"]["index"]["star"][genome][read_length]
+    threads: config["resources"]["mapping"]["cpu"]
+    conda:
+        "envs/te.yaml"
+    log:
+        "logs/mapping/{sample.log}"
+    shell:
+        "STAR --runThreadN {threads} "
+        "--runMode alignReads "
+        "--genomeDir {params.idx} "
+        "--readFilesIn {input.val1} {input.val2} "
+        "--readFilesCommand zcat "
+        "--quantMode TranscriptomeSAM GeneCounts "
+        "--twopassMode Basic "
+        "--outSAMunmapped None "
+        "--outSAMtype BAM SortedByCoordinate "
+        "--outTmpDir temp_{wildcards.sample}/ "
+        "--outFileNamePrefix mapped/{wildcards.sample}/{wildcards.sample} "
+        "--outFilterMultimapNmax 100 " #recommended by TEtranscripts
+        "--winAnchorMultimapNmax 100 " #recommended by TEtranscripts
+        "2> {log}"
+
+
+rule index:
+    input:
+        "mapped/{sample}/{sample}Aligned.sortedByCoord.out.bam",
+    output:
+        "mapped/{sample}/{sample}Aligned.sortedByCoord.out.bam.bai",
+    threads: config["resources"]["samtools"]["cpu"]
+    resources:
+        runtime=config["resources"]["samtools"]["time"]
+    conda:
+        "envs/te.yaml"
+    shell:
+        "samtools index -@ {threads} {input}"
+
+
+rule TEcount:
+    input:
+        "mapped/{sample}/{sample}Aligned.sortedByCoord.out.bam",
+    output:
+        directory("tecount/{sample}/")
+    params:
+        gtf=config["general"]["gtf"][genome],
+        te_gtf=config["general"]["te-gtf"][genome],
+        strand=config["rna-seq"]["te_strand"],
+    threads:
+    conda:
+        "envs/te.yaml"
+    log:
+        "logs/tecount/{sample}.log"
+    shell:
+        "TEcount --BAM {input} "
+        "--GTF {params.gtf} "
+        "--TE {params.te_gtf} "
+        "--stranded {params.strand} "
+        "--sortByPos "
+        "--project {wildcards.sample} "
+        "--outdir tecount/{wildcards.sample}/ "
+
+
+'''
+rule count_table:
+    input:
+        
+    output:
+
+    params:
+    threads:
+    conda:
+    log:
+    script:
+
+
+rule deseq2:
+    input:
+        
+    output:
+
+    params:
+    threads:
+    conda:
+    log:
+    script:
+'''
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

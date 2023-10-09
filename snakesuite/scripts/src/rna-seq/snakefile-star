@@ -1,0 +1,247 @@
+import glob
+import os
+import pandas as pd
+import click
+import sys
+
+
+
+####PREPARE VARIABLES FOR SNAKEMAKE RULES####
+
+#get script directory (git repository)
+script_dir = os.path.dirname(__file__)
+work_dir = os.getcwd()
+
+#load config file
+configfile: "experiment.yaml"
+
+#load variables
+genome = config["general"]["genome"]
+gtf = config["general"]["gtf"][genome]
+read_length = config["general"]["readlength"]
+
+#get sample names
+try:
+    csv = pd.read_csv("samples.csv")
+    SAMPLES = csv["sample"]
+except FileNotFoundError:
+    click.echo("ERROR: samples.csv not found!")
+    sys.exit(1)
+
+
+
+####SNAKEMAKE RULES####
+
+rule all:
+    input: 
+        expand("qc/fastqc/{sample}{end}.html", sample=SAMPLES, end=["_R1","_R2"]),
+        expand("qc/fastqc/{sample}{end}_fastqc.zip", sample=SAMPLES, end=["_R1","_R2"]),
+        expand("trimmed/{sample}_val_1.fq.gz", sample=SAMPLES),
+        expand("trimmed/{sample}_val_2.fq.gz", sample=SAMPLES),
+        expand("star/{sample}/{sample}Log.final.out", sample=SAMPLES),
+        expand("star/{sample}/{sample}Aligned.sortedByCoord.out.bam", sample=SAMPLES),
+        expand("star/{sample}/{sample}ReadsPerGene.out.tab", sample=SAMPLES),
+        expand("star/{sample}/{sample}Aligned.sortedByCoord.out.bam.bai", sample=SAMPLES),
+        "qc/multiqc.html",
+        expand("bigwig/{sample}.bigwig", sample=SAMPLES),
+        "deseq2-star/deseq2_diff_trx.xlsx",
+        "deseq2-star/dds.Rdata",
+        "plots-star/mapping_rates.pdf",
+        "plots-star/heatmap_sample_distance.pdf",
+        "plots-star/heatmap_count_matrix.pdf",
+        "plots-star/pca.pdf",
+        "plots-star/volcano_plots/",
+
+
+
+rule fastqc:
+    input:
+        "reads/{sample}{end}.fastq.gz"
+    output:
+        html="qc/fastqc/{sample}{end}.html",
+        zip="qc/fastqc/{sample}{end}_fastqc.zip"
+    params:
+        extra = "--quiet"
+    log:
+        "logs/fastqc/{sample}{end}.log"
+    threads: config["resources"]["fastqc"]["cpu"]
+    wrapper:
+        "v2.0.0/bio/fastqc"
+
+
+rule multiqc:
+    input:
+        expand("qc/fastqc/{sample}{end}_fastqc.zip", sample=SAMPLES, end=["_R1","_R2"])
+    output:
+        "qc/multiqc.html"
+    params:
+        extra="",  # Optional: extra parameters for multiqc.
+        use_input_files_only=True, # Optional, use only a.txt and don't search folder samtools_stats for files
+    log:
+        "logs/multiqc/multiqc.log"
+    wrapper:
+        "v1.31.1/bio/multiqc"
+
+
+rule trim_galore:
+    input:
+        r1="reads/{sample}_R1.fastq.gz",
+        r2="reads/{sample}_R2.fastq.gz",
+    output:
+        temp("trimmed/{sample}_val_1.fq.gz"),
+        temp("trimmed/{sample}_R1.fastq.gz_trimming_report.txt"),
+        temp("trimmed/{sample}_val_2.fq.gz"),
+        temp("trimmed/{sample}_R2.fastq.gz_trimming_report.txt"),
+    threads: config["resources"]["trim"]["cpu"]
+    conda:
+        "envs/trim_galore.yml"
+    log:
+        "logs/trim_galore/{sample}.log",
+    shell:
+        "trim_galore -j {threads} -q 20 --basename {wildcards.sample} "
+        "-o trimmed --paired {input.r1} {input.r2} 2> {log}"
+
+
+rule align:
+    input:
+        idx=config["rna-seq"]["index"]["star"][genome][read_length],
+        r1="trimmed/{sample}_val_1.fq.gz",
+        r2="trimmed/{sample}_val_2.fq.gz",
+    output:
+        "star/{sample}/{sample}Log.final.out",
+        "star/{sample}/{sample}Aligned.sortedByCoord.out.bam",
+        "star/{sample}/{sample}ReadsPerGene.out.tab",
+    log:
+        "logs/star/{sample}.log"
+    params:
+    threads: config["resources"]["mapping"]["cpu"]
+    resources: 
+        runtime=config["resources"]["mapping"]["time"]
+    conda:
+        "envs/star.yml"
+    shell:
+        "STAR "
+        "--runThreadN {threads} "
+        "--runMode alignReads "
+        "--genomeDir {input.idx} "
+        "--readFilesIn {input.r1} {input.r2} "
+        "--readFilesCommand zcat "
+        "--quantMode TranscriptomeSAM GeneCounts "
+        "--twopassMode Basic "
+        "--outSAMunmapped None "
+        "--outSAMtype BAM SortedByCoordinate "
+        "--outBAMsortingThreadN 1 "
+        "--outFileNamePrefix star/{wildcards.sample}/{wildcards.sample} "
+        "--outTmpDir temp_{wildcards.sample}/ "
+        "2> {log}"
+
+
+rule index_bam:
+    input:
+        "star/{sample}/{sample}Aligned.sortedByCoord.out.bam",
+    output:
+        "star/{sample}/{sample}Aligned.sortedByCoord.out.bam.bai",
+    threads: config["resources"]["samtools"]["cpu"]
+    resources:
+        runtime=config["resources"]["samtools"]["time"]
+    conda:
+        "envs/star.yml"
+    shell:
+        "samtools index -@ {threads} {input}"
+
+
+rule deseq2:
+    input:
+        star=expand("star/{sample}/{sample}ReadsPerGene.out.tab", sample=SAMPLES)
+    output:
+        xlsx="deseq2-star/deseq2_diff_trx.xlsx",
+        rdata="deseq2-star/dds.Rdata",
+    params:
+        map_with="star",
+        g=genome,
+        gtf=gtf,
+        strd=config["rna-seq"]["strandedness"]["star"]
+    log:
+        "logs/deseq2-star/deseq2.log"
+    conda:
+        "envs/deseq2.yml"
+    threads: config["resources"]["deseq2"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deseq2"]["time"]
+    script:
+        "scripts/deseq2.R"
+
+    
+rule bigwig:
+    input:
+        bam="star/{sample}/{sample}Aligned.sortedByCoord.out.bam",
+        bam_ind="star/{sample}/{sample}Aligned.sortedByCoord.out.bam.bai",
+    output:
+        "bigwig/{sample}.bigwig",
+    threads: config["resources"]["deeptools"]["cpu"]
+    resources: 
+        runtime=config["resources"]["deeptools"]["time"]
+    conda:
+        "envs/star.yml"
+    shell:
+        "bamCoverage --numberOfProcessors {threads} -b {input.bam} -o {output}"
+
+        
+rule heatmap_sample_distance:
+    input:
+        "deseq2-star/dds.Rdata"
+    output:
+        "plots-star/heatmap_sample_distance.pdf"
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/heatmap_sd.R"
+
+
+rule pca_plot:
+    input:
+        "deseq2-star/dds.Rdata"
+    output:
+        "plots-star/pca.pdf"
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/pca.R"
+
+
+rule volcano_plots:
+    input:
+        "deseq2-star/deseq2_diff_trx.xlsx"
+    output:
+        directory("plots-star/volcano_plots/")
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/volcano.R"
+
+
+rule heatmap_countmatrix:
+    input:
+        "deseq2-star/dds.Rdata"
+    output:
+        "plots-star/heatmap_count_matrix.pdf",
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/heatmap_cm.R"
+
+
+rule mapping_rates_plot:
+    input:
+        expand("star/{sample}/{sample}Log.final.out", sample=SAMPLES)
+    output:
+        "plots-star/mapping_rates.pdf"
+    params:
+        "star",
+        "plots-star",
+    conda:
+        "envs/deseq2.yml"
+    script:
+        "scripts/mapping_rates.R"
+
+
